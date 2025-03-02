@@ -1,2 +1,627 @@
 '''
+from pyspark.ml import Transformer
+from pyspark.ml.param.shared import HasInputCol, HasOutputCol, Param, Params
+from pyspark.sql.functions import col, log, when, sum as spark_sum
+from pyspark.sql import DataFrame
+from pyspark.sql.types import DoubleType
+from pyspark.ml.param.shared import Param, Params
+from pyspark.ml.util import DefaultParamsReadable, DefaultParamsWritable
+from sklearn.preprocessing import MinMaxScaler
+from pyspark.sql.functions import to_date, to_timestamp
+
+
+class SparkTransformCat2WoE(Transformer, HasInputCol, HasOutputCol):
+    targetCol = Param(Params._dummy(), "targetCol", "Target column name")
+
+    def __init__(self, inputCol=None, outputCol=None, targetCol=None):
+        super(SparkTransformCat2WoE, self).__init__()
+        self._setDefault(inputCol=None, outputCol=None, targetCol=None)
+        self.setParams(inputCol=inputCol, outputCol=outputCol, targetCol=targetCol)
+
+    def setParams(self, inputCol=None, outputCol=None, targetCol=None):
+        return self._set(inputCol=inputCol, outputCol=outputCol, targetCol=targetCol)
+
+    def getTargetCol(self):
+        return self.getOrDefault(self.targetCol)
+
+    def _transform(self, dataset: DataFrame) -> DataFrame:
+        inputCol = self.getOrDefault(self.inputCol)
+        outputCol = self.getOrDefault(self.outputCol)
+        targetCol = self.getTargetCol()
+
+        # Calculate WoE
+        woe_df = dataset.groupBy(inputCol).agg(
+            (log(
+                (spark_sum(when(col(targetCol) == 1, 1).otherwise(0)) / 
+                 spark_sum(when(col(targetCol) == 0, 1).otherwise(0)))
+            )).alias('WoE')
+        )
+
+        # Join WoE values back to the original dataset
+        dataset = dataset.join(woe_df, on=inputCol, how='left')
+        dataset = dataset.withColumn(outputCol, col('WoE').cast(DoubleType()))
+        dataset = dataset.drop('WoE')
+
+        return dataset
+
+
+import pandas as pd
+import numpy as np
+
+class TransformCat2WoE:
+    def __init__(self, input_col=None, output_col=None, target_col=None):
+        self.input_col = input_col
+        self.output_col = output_col
+        self.target_col = target_col
+
+    def fit_transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        input_col = self.input_col
+        output_col = self.output_col
+        target_col = self.target_col
+
+        # Calculate WoE
+        woe_df = df.groupby(input_col).apply(
+            lambda x: np.log(
+                (x[target_col].sum() / (x[target_col].count() - x[target_col].sum()))
+            )
+        ).reset_index().rename(columns={0: 'WoE'})
+
+        # Join WoE values back to the original DataFrame
+        df = df.merge(woe_df, on=input_col, how='left')
+        df[output_col] = df['WoE'].astype(float)
+        df = df.drop(columns=['WoE'])
+
+        return df
+    
+
+class SparkTransformNum2Scale(Transformer, DefaultParamsReadable, DefaultParamsWritable):
+    def __init__(self, inputCol=None, outputCol=None, targetCol=None):
+        super(SparkTransformNum2Scale, self).__init__()
+        self.inputCol = Param(self, "inputCol", "")
+        self.outputCol = Param(self, "outputCol", "")
+        self.scaler = None  # Initialize the scaler attribute
+        self._setDefault(inputCol=inputCol, outputCol=outputCol)
+    
+    def setInputCol(self, value):
+        self.set(self.inputCol, value)
+        return self
+    
+    def setOutputCol(self, value):
+        self.set(self.outputCol, value)
+        return self
+    
+    def getInputCol(self):
+        return self.getOrDefault(self.inputCol)
+    
+    def getOutputCol(self):
+        return self.getOrDefault(self.outputCol)
+    
+    def get_rescale(self, series, scaler=False):
+        '''
+        Takes an array and transforms it by rescaling it to [0, 1] where 1 is the max value in the series and 0 the min.
+        Returns object "scaler" for MLOps purposes.
+        example: rescale(df_feature = pd.Series([-1, 0, 5, 10]), scaler = False)
+        '''
+        scaler = MinMaxScaler(feature_range=(0, 1))
+        scaler = scaler.fit(series.values.reshape(-1, 1))
+        if scaler:
+            return scaler.transform(series.values.reshape(-1, 1)), scaler
+        else:
+            return scaler.transform(series.values.reshape(-1, 1))
+    
+    def _transform(self, dataset):
+        df = dataset.toPandas()
+        feature = self.getInputCol()
+        
+        # Apply rescaling and store the scaler
+        df[feature], self.scaler = self.get_rescale(df[feature])
+        
+        # Convert back to Spark DataFrame
+        spark_df = dataset.sparkSession.createDataFrame(df)
+
+        return spark_df
+
+
+class DropColumns(Transformer, DefaultParamsReadable, DefaultParamsWritable):
+    def __init__(self, columns=None):
+        super(DropColumns, self).__init__()
+        self.columns = columns
+
+    def _transform(self, df: DataFrame) -> DataFrame:
+        return df.drop(*self.columns)
+
+
+class ConvertToDate(Transformer, DefaultParamsReadable, DefaultParamsWritable):
+    def __init__(self, inputCol=None, outputCol=None, format="yyyy-MM-dd"):
+        super(ConvertToDate, self).__init__()
+        self.inputCol = inputCol
+        self.outputCol = outputCol
+        self.format = format
+
+    def _transform(self, df: DataFrame) -> DataFrame:
+        return df.withColumn(self.outputCol, to_date(col(self.inputCol), self.format))
+
+
+import mlflow
+from xgboost.spark import SparkXGBClassifier
+
+def make_Spark_XGBClassifier(n_estimators,
+                             max_depth,
+                             learning_rate,
+                             num_workers,
+                             #feature_types, 
+                             objective='binary:logistic',
+                             subsample=0.8,
+                             scale_pos_weight=1,
+                             tree_method='auto',
+                             booster='gbtree',
+                             gamma=0,
+                             min_child_weight=1,
+                             max_delta_step=0, 
+                             colsample_bytree=1,
+                             colsample_bylevel=0.8,
+                             colsample_bynode=0.8,
+                             reg_alpha=0,
+                             reg_lambda=1,
+                             verbose=1):
+    # https://www.databricks.com/blog/2020/11/16/how-to-train-xgboost-with-spark.html
+    # https://docs.databricks.com/aws/en/machine-learning/train-model/xgboost-spark
+    # https://xgboost.readthedocs.io/en/stable/tutorials/spark_estimator.html
+
+    model = SparkXGBClassifier(
+        max_depth=max_depth,          # Maximum depth of each tree
+        learning_rate=learning_rate,  # Learning rate (shrinkage) - aka "eta"
+        n_estimators=n_estimators,    # Number of boosting rounds (trees)
+        verbosity=verbose,            # Verbosity of output (0 = silent, 1 = warning, 2 = info)
+        booster=booster,              # Booster type (gbtree, gblinear, or dart)
+        tree_method=tree_method,      # Tree construction algorithm (auto, exact, approx, hist, etc.)
+        #enable_categorical=True,     # Non Distributed
+        #feature_types=feature_types, # Distributed
+        num_workers=num_workers,      # Parallel cores (n_jobs equivalent)
+        gamma=gamma,                  # Minimum loss reduction to make a further partition
+        min_child_weight=min_child_weight,  # Minimum sum of instance weight (hessian) in a child
+        max_delta_step=max_delta_step,      # Maximum delta step for each tree’s weight
+        subsample=subsample,          # Subsample ratio of training instances
+        colsample_bytree=colsample_bytree,  # Subsample ratio of columns when constructing each tree
+        colsample_bylevel=colsample_bylevel,# Subsample ratio of columns for each level
+        colsample_bynode=colsample_bynode,  # Subsample ratio of columns for each split
+        reg_alpha=reg_alpha,          # L1 regularization term on weights
+        reg_lambda=reg_lambda,        # L2 regularization term on weights
+        scale_pos_weight=scale_pos_weight,  # Control the balance of positive and negative weights
+        params={'objective': objective}  # Set custom objective
+        #base_score=0.5,              # Initial prediction score of all instances, global bias
+        #random_state=0,              # Seed for reproducibility
+        #importance_type='gain',      # Feature importance type ('weight', 'gain', 'cover', 'total_gain', 'total_cover')
+        #use_label_encoder=False,     # Disable use of the old label encoder in newer versions of XGBoost
+        #enable_sparse_data_optim=True, 
+        #missing=0.0
+    )
+   
+    return model
+
+from xgboost import XGBClassifier
+def make_XGBClassifier(n_estimators,
+               max_depth,
+               learning_rate,
+               objective = 'binary:logistic',
+               subsample = 0.8,
+               scale_pos_weight = 1,
+               tree_method = 'auto',
+               booster = 'gbtree',
+               gamma = 0,
+               min_child_weight = 1,
+               max_delta_step = 0, 
+               colsample_bytree = 1,
+               colsample_bylevel = 0.8,
+               colsample_bynode = 0.8,
+               reg_alpha = 0,
+               reg_lambda = 1,
+               verbose = 1):
+
+    # https://xgboost.readthedocs.io/en/stable/
+    model = XGBClassifier(
+        
+        max_depth = max_depth,          # Maximum depth of each tree
+        learning_rate = learning_rate,  # Learning rate (shrinkage) - aka "eta"
+        n_estimators = n_estimators,    # Number of boosting rounds (trees)
+        verbosity = verbose,            # Verbosity of output (0 = silent, 1 = warning, 2 = info)
+        objective = objective,          # Objective function (binary classification)
+        booster = booster,              # Booster type (gbtree, gblinear, or dart)
+        tree_method = tree_method,      # Tree construction algorithm (auto, exact, approx, hist, etc.)
+        enable_categorical = True,     # Non Distributed
+        #feature_types=feature_types,    # Distributed
+        #n_jobs = -1,                   # Number of parallel threads (-1 to use all cores)
+        gamma = 0,                      # Minimum loss reduction to make a further partition
+        min_child_weight = min_child_weight,  # Minimum sum of instance weight (hessian) in a child
+        max_delta_step = max_delta_step,      # Maximum delta step for each tree’s weight
+        subsample = subsample,          # Subsample ratio of training instances
+        colsample_bytree = colsample_bytree,  # Subsample ratio of columns when constructing each tree
+        colsample_bylevel = colsample_bylevel,# Subsample ratio of columns for each level
+        colsample_bynode = colsample_bynode,  # Subsample ratio of columns for each split
+        reg_alpha = reg_alpha,          # L1 regularization term on weights
+        reg_lambda = reg_lambda,        # L2 regularization term on weights
+        scale_pos_weight = scale_pos_weight,  # Control the balance of positive and negative weights
+        #base_score = 0.5,              # Initial prediction score of all instances, global bias
+        #random_state = 0,              # Seed for reproducibility
+        #importance_type = 'gain',      # Feature importance type ('weight', 'gain', 'cover', 'total_gain', 'total_cover')
+        #use_label_encoder = False      # Disable use of the old label encoder in newer versions of XGBoost
+    )
+    
+    return model
+
+import itertools
+def get_param_grid(n_estimators,
+                    max_depth,
+                    learning_rate,
+                    objective = 'binary:logistic',
+                    subsample = 0.8,
+                    scale_pos_weight = 1,
+                    tree_method = 'auto',
+                    booster = 'gbtree',
+                    gamma = 0,
+                    min_child_weight = 1,
+                    max_delta_step = 0, 
+                    colsample_bytree = 1,
+                    colsample_bylevel = 0.8,
+                    colsample_bynode = 0.8,
+                    reg_alpha = 0,
+                    reg_lambda = 1,
+                    verbose = True):
+    '''
+    returns a dictionary with all possible permutations
+    Intended for an XGBoost grid search
+    '''
+    param_grid = dict(n_estimators = n_estimators
+                        , max_depth = max_depth
+                        , learning_rate = learning_rate
+                        , scale_pos_weight = scale_pos_weight
+                      )
+    
+    keys = param_grid.keys()
+    values = (param_grid[key] for key in keys)
+    param_grid = [dict(zip(keys, param_grid)) for param_grid in itertools.product(*values)]
+    if verbose:
+        print('Proposed ' + str(len(param_grid)) + ' models')
+    return param_grid
+
+def get_performance_report(col_names, model, train_x, test_x, train_y, test_y):
+
+    performance = pd.DataFrame(columns = col_names)
+
+    train_pred_probs_y = model.predict_proba(train_x)[:, 1] 
+    test_pred_probs_y = model.predict_proba(test_x)[:, 1]
+
+    train_auc = roc_auc_score(train_y, train_pred_probs_y)
+    test_auc = roc_auc_score(test_y, test_pred_probs_y)
+
+    performance.at[1, 'train_auc'] = train_auc
+    performance.at[1, 'test_auc'] = test_auc
+    '''
+    feature_importance_df = get_feature_importances(model, features = train_x)
+
+    performance.reset_index(drop=True, inplace=True)
+    performance = pd.concat([performance, feature_importance_df], axis=1).fillna(0)
+    '''
+    return performance[col_names]
+
+
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, auc
+def plot_roc_curve(test_y, test_pred_probs_y):
+    # Compute ROC curve and ROC area for each class
+    fpr, tpr, _ = roc_curve(test_y, test_pred_probs_y)
+    roc_auc = auc(fpr, tpr)
+
+    # Plot ROC curve
+    plt.figure()
+    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.2f})')
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic (ROC) Curve')
+    plt.legend(loc="lower right")
+
+    #plt.show()
+    plt.close()
+
+    #mlflow.log_artifact(f"{"ROC_curve"}.png", artifact_path="plots")
+
+# Example usage:
+# plot_roc_curve(test_y, test_pred_probs_y)
+
+
+def perform_grid_search(param_grid, train_x, train_y, test_x, test_y, make_model, n = None):
+    '''
+
+    '''
+    col_names = ['test_auc', 'train_auc', 'n_estimators', 'max_depth', 'learning_rate', 'scale_pos_weight']
+    col_names += train_x.columns.tolist()
+
+    for j in range(0, len(param_grid)):
+
+        params = str(param_grid[j])
+        
+        n_estimators = param_grid[j].get("n_estimators")
+        max_depth = param_grid[j].get("max_depth")
+        learning_rate = param_grid[j].get("learning_rate")
+        scale_pos_weight = param_grid[j].get("scale_pos_weight")
+        
+        with mlflow.start_run():
+            model = make_model(n_estimators = n_estimators,
+                max_depth = max_depth,
+                learning_rate = learning_rate,
+                scale_pos_weight = scale_pos_weight,
+                verbose = 0)
+
+            model.fit(train_x, train_y)
+           
+            performance_report = get_performance_report(col_names = col_names
+                    , model = model
+                    , train_x = train_x
+                    , test_x = test_x
+                    , train_y = train_y
+                    , test_y = test_y)
+            
+             # Log parameters and metrics to MLflow
+            mlflow.log_params(params)
+            mlflow.log_metrics({'test_auc': performance_report['test_auc'], 
+                                'train_auc': performance_report['train_auc']
+                                })
+            mlflow.xgboost.log_model(model, "model")
+
+            #write_df(performance_report, 'performance_report.csv')
+
+    return
+
+
+from pyspark.ml.feature import VectorAssembler
+def spark_get_assembled(train_df, test_df, target="Target"):
+    '''
+    Its important to assemble both sets uwing the same assmebler
+    '''
+    feature_columns = [col for col in train_df.columns if col != target]
+    assembler = VectorAssembler(inputCols=feature_columns, outputCol="features")
+    train_df = assembler.transform(train_df).select("features", target)
+    test_df = assembler.transform(test_df).select("features", target)
+    assembler_feature_names = assembler.getInputCols()
+
+    return train_df, test_df, assembler_feature_names
+
+import pandas as pd
+def get_feature_importances(model, feature_names):
+    '''
+    Retrieve feature importance scores
+    '''
+    # Assuming your trained model is named `xgb_model`
+    booster = model.get_booster()
+    feature_importances = booster.get_score(importance_type='weight')
+
+    # Create a mapping of feature indices to feature names
+    feature_importance_dict = {f"f{i}": feature_names[i] for i in range(len(feature_names))}
+
+
+    feature_importance_df = pd.DataFrame(list(feature_importances.items()), columns=['Feature', 'Importance'])
+    feature_importance_df['Feature'] = feature_importance_df['Feature'].map(feature_importance_dict)
+    feature_importance_df = feature_importance_df.sort_values(by='Importance', ascending=False)
+    feature_importance_df = feature_importance_df.set_index('Feature').T
+    feature_importance_df.reset_index(drop=True, inplace=True)
+
+    return feature_importance_df
+
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+import pandas as pd
+
+def get_Spark_performance_report(model, train_df, test_df, feature_names, param_grid, iteration_time):
+    evaluator_auc = BinaryClassificationEvaluator(rawPredictionCol="probability", labelCol="Target", metricName="areaUnderROC")
+    evaluator_precision = MulticlassClassificationEvaluator(
+        labelCol="Target", predictionCol="prediction", metricName="weightedPrecision")
+    evaluator_recall = MulticlassClassificationEvaluator(
+        labelCol="Target", predictionCol="prediction", metricName="weightedRecall")
+    evaluator_f1 = MulticlassClassificationEvaluator(
+        labelCol="Target", predictionCol="prediction", metricName="f1")
+
+
+    train_pred = model.transform(train_df)
+    #train_pred_probs_y = train_pred.select("probability")
+    test_pred = model.transform(test_df)
+    #train_pred_probs_y = test_pred.select("probability")
+
+    auc_train = evaluator_auc.evaluate(train_pred)
+    auc_test = evaluator_auc.evaluate(test_pred)
+    precision_train = evaluator_precision.evaluate(train_pred)
+    precision_test = evaluator_precision.evaluate(test_pred)
+    recall_train = evaluator_recall.evaluate(train_pred)
+    recall_test = evaluator_recall.evaluate(test_pred)
+    f1_train = evaluator_f1.evaluate(train_pred)
+    f1_test = evaluator_f1.evaluate(test_pred)
+
+    performance = pd.DataFrame()
+    performance.at[1, 'train_auc'] = auc_train
+    performance.at[1, 'test_auc'] = auc_test
+    performance.at[1, 'precision_train'] = precision_train
+    performance.at[1, 'precision_test'] = precision_test
+    performance.at[1, 'recall_train'] = recall_train
+    performance.at[1, 'recall_test'] = recall_test
+    performance.at[1, 'f1_train'] = f1_train
+    performance.at[1, 'f1_test'] = f1_test
+    performance.at[1, 'trian_time'] = iteration_time
+
+    feature_importance_df = get_feature_importances(model, feature_names = feature_names)
+    performance.reset_index(drop=True, inplace=True)
+    performance = pd.concat([performance, feature_importance_df], axis=1).fillna(0)
+
+    for key, value in param_grid.items():
+        performance[key] = value
+
+    return performance 
+
+
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, auc
+import numpy as np
+import mlflow
+import io
+import tempfile
+
+def plot_Spark_roc_curve(model, test_data, label_col):
+    """
+    Function to plot the ROC curve and return the path to the saved PNG image.
+    
+    Parameters:
+    model: Trained SparkXGBClassifier model
+    test_data: Test data in the form of a Spark DataFrame
+    label_col: Name of the column containing the true labels
+    
+    Returns:
+    Path to the saved PNG image
+    """
+    # Predict probabilities for the test data
+    predictions = model.transform(test_data)
+    
+    # Extract the probability of the positive class
+    y_score = np.array(predictions.select("probability").rdd.map(lambda x: x[0][1]).collect())
+    
+    # Extract the true labels
+    labels = np.array(test_data.select(label_col).rdd.flatMap(lambda x: x).collect())
+    
+    # Compute ROC curve and ROC area
+    fpr, tpr, _ = roc_curve(labels, y_score)
+    roc_auc = auc(fpr, tpr)
+    
+    # Plot ROC curve
+    plt.figure()
+    plt.plot(fpr, tpr, color='darkorange', lw=2, label='ROC curve (area = %0.2f)' % roc_auc)
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic')
+    plt.legend(loc="lower right")
+    
+    # Save the plot as a PNG image to a temporary file
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    plt.savefig(temp_file.name, format='png')
+    plt.close()
+    temp_file.close()
+    
+    return temp_file.name
+
+
+import matplotlib as mpl
+# function to plot confussion matrix
+def plot_confussion_matrix(labels, predictions, classes, figsize = 3):
+    
+    con_mat = tf.math.confusion_matrix(labels, predictions).numpy()
+    con_mat_norm = np.around(con_mat.astype('float') / con_mat.sum(axis = 1)[:, np.newaxis], decimals = 3)
+    con_mat_df = pd.DataFrame(con_mat_norm,
+                         index = classes, 
+                         columns = classes)
+    figure = plt.figure(figsize=(figsize, figsize))
+    sns.heatmap(con_mat_df
+                , annot=True
+                , xticklabels=classes
+                , yticklabels=classes
+                #, cmap=plt.cm.Blues
+                )
+    plt.tight_layout()
+    plt.ylabel('True label')
+    plt.xlabel('Predicted label')
+    plt.xlim(-0.0, len(classes))
+    plt.ylim(len(classes), -0.0)
+    plt.show()
+
+    return con_mat_df
+    
+import shap
+def get_shap_plot(df, model_, explainer_size, target='target', model_type = 'NN'):
+    """
+    Generates a SHAP summary plot for an XGBoost model.
+    
+    Parameters:
+    - df (pd.DataFrame): DataFrame containing features and target.
+    - model_ (xgboost.XGBModel): Trained XGBoost model.
+    - target (str): Name of the target column in df.
+    
+    Returns:
+    - None (plots SHAP summary plot).
+    """
+    # Set explainer parameters
+    explainer_size = explainer_size  # Number of data points to use for SHAP explanation
+    current_label = 0    # For multiclass classification, select label (usually 0 or 1 for binary)
+    
+    # Extract features excluding the target column
+    df_features = df[df.columns.difference([target])]
+
+    # specify model
+    if model_type == 'NN':
+        explainer = shap.KernelExplainer(model = model_.predict
+                                     , data = df_features.head(explainer_size)
+                                     , link = "identity")
+    elif model_type == 'tree':
+        explainer = shap.TreeExplainer(model_)
+    else:
+        print('Model not supported')
+    
+
+    # Calculate SHAP values for a subset of data to visualize feature importance
+    shap_values = explainer.shap_values(df_features.head(explainer_size))
+
+    # Initialize SHAP JavaScript visualization
+    shap.initjs()
+
+    # alternative on handling categorical values:
+    # https://docs.seldon.io/projects/alibi/en/stable/examples/kernel_shap_adult_lr.html
+    
+    if isinstance(shap_values, list):  # Multi-class output
+        shap_values_to_plot = shap_values[current_label]
+    else:  # Binary classification or regression
+        shap_values_to_plot = shap_values
+
+    
+    # top to bottom represent feature relevance
+    # blue values represent low values in feature
+    # red values represent high values in feature
+    # left axis values represent negative shap, negative weight to prediction
+    # right axis values represent positive shap, positive weight to prediction
+        
+    shap.summary_plot(
+        shap_values=shap_values_to_plot,
+        features=df_features.head(explainer_size),
+        feature_names=df_features.columns
+    )
+
+def get_optimal_cutoff(df, prob, target, pnl, retention_cost = 0):
+    # Define cutoffs from 0 to 1 with step 0.01
+    max_net_benefit = -np.inf
+    optimal_cutoff = 0
+    
+    # Iterate through each cutoff and calculate the net benefit
+    for cutoff in np.arange(0, 1.01, 0.01):
+        # Predict target based on the cutoff
+        predicted_target = (df[prob] >= cutoff).astype(int)
+    
+        # Vectorized calculation of net benefit
+        true_positive = (predicted_target == 1) & (df[target] == 1)
+        false_positive = (predicted_target == 1) & (df[target] == 0)
+        true_negative = (predicted_target == 0) & (df[target] == 0)
+        false_negative = (predicted_target == 0) & (df[target] == 1)
+    
+        # Calculate total net benefit at this cutoff
+        net_benefit = (
+            df.loc[true_positive, pnl].sum() - true_positive.sum() * retention_cost +
+            df.loc[false_positive, pnl].sum() - false_positive.sum() * retention_cost +
+            df.loc[true_negative, pnl].sum() +
+            df.loc[false_negative, pnl].sum()
+        )
+    
+        # Update if current cutoff yields a higher net benefit
+        if net_benefit > max_net_benefit:
+            max_net_benefit = net_benefit
+            optimal_cutoff = cutoff
+    
+    return optimal_cutoff, max_net_benefit
 '''
