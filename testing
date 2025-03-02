@@ -625,3 +625,99 @@ def get_optimal_cutoff(df, prob, target, pnl, retention_cost = 0):
     
     return optimal_cutoff, max_net_benefit
 '''
+train_df, test_df = ml_utils.spark_get_val_test_train_time(
+                            df = data
+                            , time_column = 'Snapshot_date'
+                            , test_size = 0.3
+                            , target = 'Target'
+                            , oversample = False
+                            , factor = 1)
+
+# To assemble features is necesary for XGBoost distributed
+train_df, test_df, assembler_feature_names = mlflow_train.spark_get_assembled(train_df, test_df, target="Target")
+
+import mlflow
+import tempfile
+import time
+import pandas as pd
+import shutil
+
+def perform_grid_search(param_grid, train_df, test_df, n=None):
+    '''
+    Perform grid search with the given parameter grid and datasets.
+    '''
+    # Create a temporary file with a .csv suffix
+    temp_file_report = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+    destination_path = rf"performance_report.csv"
+
+    performance_list = []
+
+    requirements = """
+    pyspark==3.1.2
+    xgboost==1.4.2
+    """
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+    with open(temp_file.name, 'w') as f:
+        f.write(requirements)
+
+    for j in range(0, len(param_grid)):
+        
+        start_time = time.time()  # Record the start time
+        
+        with mlflow.start_run():
+            model = mlflow_train.make_Spark_XGBClassifier(
+                    n_estimators = param_grid[j].get("n_estimators"),
+                    max_depth = param_grid[j].get("max_depth"),
+                    learning_rate = param_grid[j].get("learning_rate"),
+                    scale_pos_weight = param_grid[j].get("scale_pos_weight"),
+                    subsample = param_grid[j].get("subsample"),
+                    gamma = param_grid[j].get("gamma"),
+                    min_child_weight = param_grid[j].get("min_child_weight"),
+                    max_delta_step = param_grid[j].get("max_delta_step"),
+                    colsample_bytree = param_grid[j].get("colsample_bytree"),
+                    colsample_bylevel = param_grid[j].get("colsample_bylevel"),
+                    colsample_bynode = param_grid[j].get("colsample_bynode"),
+                    num_workers = sc.defaultParallelism,
+                    verbose = 0)
+            
+            model = model.fit(train_df.withColumnRenamed('Target', 'label'))
+
+            end_time = time.time()  # Record the end time
+            iteration_time = str(end_time - start_time)  # Calculate the duration
+           
+            performance = mlflow_train.get_Spark_performance_report(model,
+                                train_df,
+                                test_df,
+                                feature_names = assembler_feature_names,
+                                param_grid = param_grid[j],
+                                iteration_time = iteration_time) 
+            performance_list.append(performance)
+
+            performance_report = pd.concat(performance_list
+                                        , ignore_index=True).sort_values(by='test_auc'
+                                            , ascending=False)
+            performance_report.to_csv(temp_file_report.name, index=False)
+            shutil.move(temp_file_report.name, destination_path)
+            
+            # Log parameters and metrics to MLflow
+            mlflow.log_params(param_grid[j])
+            mlflow.log_metrics(
+                {
+                'test_auc': performance['test_auc'].iloc[0], 
+                'train_auc': performance['train_auc'].iloc[0],
+                'precision_test': performance['precision_test'].iloc[0], 
+                'recall_test': performance['recall_test'].iloc[0],
+                'f1_test': performance['f1_test'].iloc[0]
+                })
+            
+            #mlflow.spark.log_model(spark_model=model, artifact_path="model")
+            mlflow.spark.log_model(
+                            spark_model=model,
+                            artifact_path="model",
+                            pip_requirements=temp_file.name
+                        )
+    
+            image_path = mlflow_train.plot_Spark_roc_curve(model, test_df, label_col="Target")
+            mlflow.log_artifact(image_path, "roc_curve.png")
+
+    return performance_report
